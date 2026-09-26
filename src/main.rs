@@ -4,21 +4,27 @@ use std::{
     process::Command,
 };
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 
 // All famitracker exported .wav files have this much seconds of dead air at the start and end of the track
 const FAMITRACKER_SILENCE_START: f64 = 0.084;
 const FAMITRACKER_SILENCE_END: f64 = 0.1;
+const HARD_PAN_BOOST_DB: f64 = 2.0;
+const SOFT_PAN_BOOST_DB: f64 = 1.5;
 
 #[derive(Parser)]
 #[command(about = "Mix Famitracker mono WAV stems into a stereo OGG")]
 struct Args {
     /// Folder containing the exported .wav stems (defaults to the current directory)
     folder: Option<PathBuf>,
+
+    /// Mix panned stems louder (hard pan +3 dB, soft pan +1.5 dB)
+    #[arg(short, long)]
+    amplify_panned: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Pan {
     left: f64,
     right: f64,
@@ -57,8 +63,22 @@ impl Pan {
         }
     }
 
-    fn filter(self) -> String {
-        format!("pan=stereo|c0={}*c0|c1={}*c0", self.left, self.right)
+    fn amplify_db(self) -> Option<f64> {
+        if self == Self::HARD_LEFT || self == Self::HARD_RIGHT {
+            Some(HARD_PAN_BOOST_DB)
+        } else if self == Self::LEFT || self == Self::RIGHT {
+            Some(SOFT_PAN_BOOST_DB)
+        } else {
+            None
+        }
+    }
+
+    fn filter(self, amplify_panned: bool) -> String {
+        let pan = format!("pan=stereo|c0={}*c0|c1={}*c0", self.left, self.right);
+        match (amplify_panned, self.amplify_db()) {
+            (true, Some(db)) => format!("{pan},volume={db}dB"),
+            _ => pan,
+        }
     }
 }
 
@@ -68,12 +88,15 @@ fn main() -> anyhow::Result<()> {
         Some(folder) => folder,
         None => std::env::current_dir().context("failed to get current directory")?,
     };
-    run(&folder)
+    run(&folder, args.amplify_panned)
 }
 
-fn run(folder: &Path) -> anyhow::Result<()> {
+fn run(folder: &Path, amplify_panned: bool) -> anyhow::Result<()> {
     if !folder.is_dir() {
-        bail!("folder does not exist or is not a directory: {}", folder.display());
+        bail!(
+            "folder does not exist or is not a directory: {}",
+            folder.display()
+        );
     }
 
     let wavs = collect_wavs(folder)?;
@@ -93,7 +116,7 @@ fn run(folder: &Path) -> anyhow::Result<()> {
     let output_name = prompt_output_name()?;
     let output_path = folder.join(format!("{output_name}.ogg"));
 
-    run_ffmpeg(&wavs, &pans, &output_path)?;
+    run_ffmpeg(&wavs, &pans, amplify_panned, &output_path)?;
     println!("Wrote {}", output_path.display());
     if let Err(err) = open_in_explorer(&output_path) {
         eprintln!("Could not open File Explorer: {err}");
@@ -177,16 +200,16 @@ fn prompt_output_name() -> anyhow::Result<String> {
             continue;
         }
 
-        if let Some(stripped) = name.strip_suffix(".ogg").or_else(|| name.strip_suffix(".OGG")) {
+        if let Some(stripped) = name
+            .strip_suffix(".ogg")
+            .or_else(|| name.strip_suffix(".OGG"))
+        {
             name = stripped.to_string();
         }
 
         if name.is_empty()
             || name.contains(['/', '\\'])
-            || Path::new(&name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                != Some(name.as_str())
+            || Path::new(&name).file_name().and_then(|n| n.to_str()) != Some(name.as_str())
         {
             println!("Name cannot be empty or contain path separators.");
             continue;
@@ -196,8 +219,13 @@ fn prompt_output_name() -> anyhow::Result<String> {
     }
 }
 
-fn run_ffmpeg(wavs: &[PathBuf], pans: &[Pan], output_path: &Path) -> anyhow::Result<()> {
-    let filter = build_filter_complex(wavs.len(), pans);
+fn run_ffmpeg(
+    wavs: &[PathBuf],
+    pans: &[Pan],
+    amplify_panned: bool,
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    let filter = build_filter_complex(wavs.len(), pans, amplify_panned);
 
     let mut command = Command::new("ffmpeg");
     command.arg("-y");
@@ -228,11 +256,11 @@ fn run_ffmpeg(wavs: &[PathBuf], pans: &[Pan], output_path: &Path) -> anyhow::Res
     Ok(())
 }
 
-fn build_filter_complex(input_count: usize, pans: &[Pan]) -> String {
+fn build_filter_complex(input_count: usize, pans: &[Pan], amplify_panned: bool) -> String {
     let mut filter = String::new();
 
     for (i, pan) in pans.iter().enumerate() {
-        filter.push_str(&format!("[{i}:a]{}[a{i}];", pan.filter()));
+        filter.push_str(&format!("[{i}:a]{}[a{i}];", pan.filter(amplify_panned)));
     }
 
     for i in 0..input_count {
